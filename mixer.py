@@ -516,7 +516,7 @@ class StudioMixer:
         return elem
 
     def build_pipeline(self) -> Gst.Pipeline:
-        pipeline = Gst.Pipeline.new("studio-mix")
+        pipeline = Gst.Pipeline.new("stream-mix")
         elements: dict[str, Gst.Element] = {}
 
         cam_src = self.make_element("rtspsrc", "cam_src")
