@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Studio mix</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, sans-serif;
+      background: #111;
+      color: #eee;
+    }
+    body { max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; margin-bottom: 0.25rem; }
+    h2 { font-size: 1rem; margin: 1.75rem 0 0.75rem; font-weight: 600; }
+    p.sub { color: #999; margin-top: 0; font-size: 0.9rem; }
+    label {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 0.75rem;
+      align-items: center;
+      margin: 1rem 0;
+    }
+    input[type="range"] { width: 100%; }
+    .val { min-width: 4.5rem; text-align: right; font-variant-numeric: tabular-nums; }
+    .status { margin-top: 1.5rem; padding: 0.75rem; border-radius: 0.5rem; background: #1a1a1a; font-size: 0.85rem; }
+    .streams { display: grid; gap: 0.75rem; }
+    .stream-row {
+      display: grid;
+      grid-template-columns: 5.5rem 1fr auto;
+      gap: 0.75rem;
+      align-items: center;
+      padding: 0.75rem;
+      border-radius: 0.5rem;
+      background: #1a1a1a;
+    }
+    .stream-name { font-weight: 600; font-size: 0.9rem; }
+    .stream-status { font-size: 0.85rem; }
+    .stream-actions { display: flex; gap: 0.5rem; }
+    button {
+      font: inherit;
+      font-size: 0.85rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 0.35rem;
+      border: 1px solid #333;
+      background: #222;
+      color: #eee;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #2a2a2a; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.primary { background: #1a4d2e; border-color: #2d7a4a; }
+    button.primary:hover:not(:disabled) { background: #226339; }
+    button.danger { background: #4d1a1a; border-color: #7a2d2d; }
+    button.danger:hover:not(:disabled) { background: #632222; }
+    .ok { color: #7dffa3; }
+    .warn { color: #ffb347; }
+    .err { color: #ff7d7d; }
+    .muted { color: #777; }
+    .orient-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 0.75rem;
+      align-items: center;
+      margin: 1rem 0;
+    }
+    select {
+      font: inherit;
+      font-size: 0.9rem;
+      padding: 0.35rem 0.5rem;
+      border-radius: 0.35rem;
+      border: 1px solid #333;
+      background: #222;
+      color: #eee;
+    }
+  </style>
+</head>
+<body>
+  <h1>Studio mix</h1>
+  <p class="sub">Live delay and level knobs. Changes apply without restarting the outgoing stream.</p>
+
+  <div class="status" id="status">Loading…</div>
+
+  <h2>Destinations</h2>
+  <p class="sub">Stream keys live in <code>APPDATA/studio-mix/stream-keys.env</code> and stay the same until you reset them on Twitch or YouTube.</p>
+  <div class="streams">
+    <div class="stream-row">
+      <div class="stream-name">Twitch</div>
+      <div class="stream-status" id="twitch-status">…</div>
+      <div class="stream-actions">
+        <button class="primary" id="twitch-start" disabled>Start</button>
+        <button class="danger" id="twitch-stop" disabled>Stop</button>
+      </div>
+    </div>
+    <div class="stream-row">
+      <div class="stream-name">YouTube</div>
+      <div class="stream-status" id="youtube-status">…</div>
+      <div class="stream-actions">
+        <button class="primary" id="youtube-start" disabled>Start</button>
+        <button class="danger" id="youtube-stop" disabled>Stop</button>
+      </div>
+    </div>
+  </div>
+
+  <h2>Mix</h2>
+
+  <div class="orient-row">
+    <label for="video_rotation">Video orientation</label>
+    <select id="video_rotation">
+      <option value="0">Normal</option>
+      <option value="90">Rotate 90° clockwise</option>
+      <option value="180">Upside down (180°)</option>
+      <option value="270">Rotate 90° counter-clockwise</option>
+    </select>
+  </div>
+
+  <label>Stream video bitrate <span class="val" id="v-stream_video_bitrate_kbps">2500 kbps</span>
+    <input type="range" id="stream_video_bitrate_kbps" min="800" max="4500" step="100" value="2500">
+  </label>
+  <p class="sub">720p30 output. Lower bitrate if Twitch/YouTube buffer (~2.5 Mbps × 2 streams ≈ 5 Mbps upload).</p>
+
+  <label>GoPro video delay <span class="val" id="v-gopro_video_delay_ms">0 ms</span>
+    <input type="range" id="gopro_video_delay_ms" min="0" max="60000" step="100" value="0">
+  </label>
+  <label>GoPro audio delay <span class="val" id="v-gopro_audio_delay_ms">0 ms</span>
+    <input type="range" id="gopro_audio_delay_ms" min="0" max="60000" step="100" value="0">
+  </label>
+  <label>Ableton audio delay <span class="val" id="v-ableton_audio_delay_ms">2500 ms</span>
+    <input type="range" id="ableton_audio_delay_ms" min="0" max="60000" step="100" value="2500">
+  </label>
+  <label>GoPro audio level <span class="val" id="v-gopro_audio_level">25%</span>
+    <input type="range" id="gopro_audio_level" min="0" max="200" step="1" value="25">
+  </label>
+  <label>Ableton audio level <span class="val" id="v-ableton_audio_level">100%</span>
+    <input type="range" id="ableton_audio_level" min="0" max="200" step="1" value="100">
+  </label>
+
+  <script>
+    const ids = [
+      'gopro_video_delay_ms', 'gopro_audio_delay_ms', 'ableton_audio_delay_ms',
+      'gopro_audio_level', 'ableton_audio_level', 'stream_video_bitrate_kbps',
+    ];
+
+    const platforms = [
+      { id: 'twitch', label: 'Twitch' },
+      { id: 'youtube', label: 'YouTube' },
+    ];
+
+    function fmt(id, value) {
+      const el = document.getElementById('v-' + id);
+      if (id.endsWith('_level')) el.textContent = value + '%';
+      else if (id === 'stream_video_bitrate_kbps') el.textContent = value + ' kbps';
+      else if (id.endsWith('_delay_ms') && value >= 1000) el.textContent = (value / 1000).toFixed(1) + ' s';
+      else if (id.endsWith('_delay_ms')) el.textContent = value + ' ms';
+      else el.textContent = value + ' ms';
+    }
+
+    function camStatusText(s) {
+      if (s.cam_ready) return 'live';
+      if (s.cam_using_fallback) return 'fallback';
+      if (s.fallback_video_available) return 'offline (fallback ready)';
+      return 'offline';
+    }
+
+    function sourcesReady(s) {
+      return s.ableton_ready && (s.cam_ready || s.fallback_video_available);
+    }
+
+    function platformStatusText(platform, s) {
+      const configured = s[platform + '_configured'];
+      const streaming = s[platform + '_streaming'];
+      const enabled = s[platform + '_enabled'];
+      const lastError = s[platform + '_last_error'];
+      if (!configured) return { text: 'Not configured', cls: 'muted' };
+      if (lastError) return { text: 'Error — click Start to retry', cls: 'err' };
+      if (streaming) return { text: 'Sending', cls: 'warn' };
+      if (enabled && !s.pipeline_running) return { text: 'Starting…', cls: 'warn' };
+      if (enabled) return { text: 'Enabled', cls: 'warn' };
+      if (!sourcesReady(s)) return { text: 'Waiting for sources', cls: 'warn' };
+      return { text: 'Ready', cls: 'warn' };
+    }
+
+    function updatePlatformUI(s) {
+      for (const { id } of platforms) {
+        const { text, cls } = platformStatusText(id, s);
+        const statusEl = document.getElementById(id + '-status');
+        statusEl.innerHTML = `<span class="${cls}">${text}</span>`;
+
+        const configured = s[id + '_configured'];
+        const streaming = s[id + '_streaming'];
+        const lastError = s[id + '_last_error'];
+        const ready = sourcesReady(s);
+        const startBtn = document.getElementById(id + '-start');
+        const stopBtn = document.getElementById(id + '-stop');
+
+        startBtn.disabled = !configured || streaming || (!ready && !lastError);
+        stopBtn.disabled = !configured || (!s[id + '_enabled'] && !lastError);
+      }
+    }
+
+    async function setPlatform(platform, enabled) {
+      const res = await fetch('/api/stream/' + platform, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        alert('Failed to ' + (enabled ? 'start' : 'stop') + ' ' + platform + ': ' + msg);
+        return;
+      }
+      await loadState();
+    }
+
+    async function loadState() {
+      const res = await fetch('/api/state');
+      const s = await res.json();
+      for (const id of ids) {
+        const input = document.getElementById(id);
+        const val = id.endsWith('_level') ? Math.round(s[id] * 100) : s[id];
+        input.value = val;
+        fmt(id, val);
+      }
+      document.getElementById('video_rotation').value = String(s.video_rotation ?? 0);
+      const st = document.getElementById('status');
+      const pipe = s.pipeline_running ? 'running' : 'waiting for sources';
+      const cls = s.pipeline_running ? 'ok' : 'warn';
+      st.innerHTML = `<span class="${cls}">Pipeline ${pipe}</span> · cam ${camStatusText(s)} · ableton ${s.ableton_ready ? 'live' : 'offline'}`;
+      updatePlatformUI(s);
+    }
+
+    let saveTimer;
+    function queueSave() {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(saveState, 150);
+    }
+
+    async function saveState() {
+      const body = {};
+      for (const id of ids) {
+        const raw = Number(document.getElementById(id).value);
+        body[id] = id.endsWith('_level') ? raw / 100 : raw;
+        fmt(id, raw);
+      }
+      body.video_rotation = Number(document.getElementById('video_rotation').value);
+      await fetch('/api/state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      await loadState();
+    }
+
+    for (const id of ids) {
+      document.getElementById(id).addEventListener('input', (e) => {
+        fmt(id, Number(e.target.value));
+        queueSave();
+      });
+    }
+
+    document.getElementById('video_rotation').addEventListener('change', queueSave);
+
+    for (const { id } of platforms) {
+      document.getElementById(id + '-start').addEventListener('click', () => setPlatform(id, true));
+      document.getElementById(id + '-stop').addEventListener('click', () => setPlatform(id, false));
+    }
+
+    loadState();
+    setInterval(loadState, 3000);
+  </script>
+</body>
+</html>
