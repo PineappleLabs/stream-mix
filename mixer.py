@@ -25,12 +25,17 @@ FALLBACK_VIDEO = Path(
     os.environ.get("FALLBACK_VIDEO_PATH", "/app/assets/citadelSkullVisualizer.mp4")
 )
 
+NUM_TRACKS = 8
+
 DEFAULT_STATE = {
     "gopro_video_delay_ms": 0,
     "gopro_audio_delay_ms": 0,
     "ableton_audio_delay_ms": 2500,
+    "tracks_audio_delay_ms": 2500,
     "gopro_audio_level": 0.25,
     "ableton_audio_level": 1.0,
+    **{f"track_{i}_level": 1.0 for i in range(1, NUM_TRACKS + 1)},
+    **{f"track_{i}_name": f"Track {i}" for i in range(1, NUM_TRACKS + 1)},
     "twitch_enabled": False,
     "youtube_enabled": False,
     "video_rotation": 0,
@@ -55,6 +60,7 @@ MEDIAMTX_RTMP_PORT = os.environ.get("MEDIAMTX_RTMP_PORT", "1935")
 
 CAM_PATH = os.environ["CAM_PATH"]
 ABLETON_PATH = os.environ["ABLETON_PATH"]
+TRACKS_PATH = os.environ.get("TRACKS_PATH", "").strip()
 PROGRAM_PATH = os.environ["PROGRAM_PATH"]
 
 
@@ -72,6 +78,7 @@ class StudioMixer:
         self.pipeline_running = False
         self.cam_ready = False
         self.ableton_ready = False
+        self.tracks_ready = False
         self.cam_using_fallback = False
         self.lock = threading.Lock()
         self._stop = False
@@ -130,7 +137,9 @@ class StudioMixer:
     def sources_ready(self) -> bool:
         self.cam_ready = self.probe_rtsp(CAM_PATH)
         self.ableton_ready = self.probe_rtsp(ABLETON_PATH)
-        return self.ableton_ready and (self.cam_ready or self.fallback_available())
+        self.tracks_ready = bool(TRACKS_PATH) and self.probe_rtsp(TRACKS_PATH)
+        audio_ready = self.ableton_ready or self.tracks_ready
+        return audio_ready and (self.cam_ready or self.fallback_available())
 
     def platform_configured(self, platform: str) -> bool:
         env_key = f"{platform.upper()}_STREAM_KEY"
@@ -195,7 +204,10 @@ class StudioMixer:
 
     def _flvmux_latency_ns(self) -> int:
         video_delay = int(self.state.get("gopro_video_delay_ms", 0))
-        audio_delay = int(self.state.get("ableton_audio_delay_ms", 0))
+        audio_delay = max(
+            int(self.state.get("ableton_audio_delay_ms", 0)),
+            int(self.state.get("tracks_audio_delay_ms", 0)),
+        )
         return ms_to_ns(max(video_delay, audio_delay, 0))
 
     def _apply_flvmux_latency(self) -> None:
@@ -212,6 +224,7 @@ class StudioMixer:
         audio_delay_map = {
             "cam_mix_pad": "gopro_audio_delay_ms",
             "abl_mix_pad": "ableton_audio_delay_ms",
+            "tracks_mix_pad": "tracks_audio_delay_ms",
         }
         level_map = {
             "cam_vol": "gopro_audio_level",
@@ -234,6 +247,10 @@ class StudioMixer:
                     elem.set_property("volume", 0.0)
                 else:
                     elem.set_property("volume", float(self.state[state_key]))
+        for i in range(1, NUM_TRACKS + 1):
+            elem = self.elements.get(f"track_vol_{i}")
+            if elem:
+                elem.set_property("volume", float(self.state[f"track_{i}_level"]))
         for platform in PLATFORM_SINKS:
             enabled = bool(self.state.get(f"{platform}_enabled"))
             self._set_platform_valve(platform, drop=not enabled)
@@ -369,6 +386,8 @@ class StudioMixer:
             "pipeline_running": self.pipeline_running,
             "cam_ready": self.cam_ready,
             "ableton_ready": self.ableton_ready,
+            "tracks_configured": bool(TRACKS_PATH),
+            "tracks_ready": self.tracks_ready,
             "cam_using_fallback": self.cam_using_fallback,
             "fallback_video_available": self.fallback_available(),
             "twitch_configured": self.platform_configured("twitch"),
@@ -508,6 +527,79 @@ class StudioMixer:
         )
         mix_pad.set_property("offset", ms_to_ns(int(self.state[delay_key])))
 
+    def add_tracks_branch(
+        self,
+        pipeline: Gst.Pipeline,
+        mix: Gst.Element,
+        elements: dict[str, Gst.Element],
+    ) -> None:
+        """N-channel RTP audio feed (L16/L24/Opus) -> per-channel volume -> submix -> master mix."""
+        src = self.make_element("rtspsrc", "tracks_src")
+        src.set_property("location", self.rtsp_url(TRACKS_PATH))
+        src.set_property("protocols", "tcp")
+        src.set_property("latency", 200)
+        src.set_property("drop-on-latency", True)
+        src.set_property("do-rtsp-keep-alive", True)
+        decode = self.make_element("decodebin", "tracks_decode")
+        convert = self.make_element("audioconvert", "tracks_convert")
+        float_caps = self.make_element("capsfilter", "tracks_float")
+        float_caps.set_property("caps", Gst.Caps.from_string("audio/x-raw,format=F32LE"))
+        deint = self.make_element("deinterleave", "tracks_deint")
+        submix = self.make_element("audiomixer", "tracks_submix")
+        submix.set_property("start-time-selection", 1)
+        sub_queue = self.make_queue("tracks_queue")
+        for elem in (src, decode, convert, float_caps, deint, submix, sub_queue):
+            pipeline.add(elem)
+        self.link_many(convert, float_caps, deint)
+        self.link_many(submix, sub_queue)
+        mix_pad = mix.request_pad_simple("sink_%u")
+        if not mix_pad:
+            raise RuntimeError("failed to request audiomixer pad")
+        sub_queue.get_static_pad("src").link(mix_pad)
+        mix_pad.set_property("offset", ms_to_ns(int(self.state["tracks_audio_delay_ms"])))
+        elements["tracks_mix_pad"] = mix_pad
+
+        def on_src_pad_added(_src: Gst.Element, pad: Gst.Pad, _user_data: object) -> None:
+            caps = pad.get_current_caps()
+            if not caps:
+                return
+            if caps.get_structure(0).get_string("media") == "audio":
+                pad.link(decode.get_static_pad("sink"))
+
+        def on_decoded_pad_added(_dec: Gst.Element, pad: Gst.Pad, _user_data: object) -> None:
+            caps = pad.get_current_caps() or pad.query_caps(None)
+            if caps and caps.get_structure(0).get_name().startswith("audio/x-raw"):
+                pad.link(convert.get_static_pad("sink"))
+
+        def on_channel_pad_added(_deint: Gst.Element, pad: Gst.Pad, _user_data: object) -> None:
+            idx = int(pad.get_name().split("_")[-1])
+            if idx >= NUM_TRACKS:
+                sink = self.make_element("fakesink", f"tracks_extra_sink_{idx}")
+                pipeline.add(sink)
+                sink.sync_state_with_parent()
+                pad.link(sink.get_static_pad("sink"))
+                return
+            n = idx + 1
+            queue = self.make_queue(f"tracks_ch{n}_queue")
+            vol = self.make_element("volume", f"track_vol_{n}")
+            conv = self.make_element("audioconvert", f"tracks_ch{n}_convert")
+            caps = self.make_element("capsfilter", f"tracks_ch{n}_caps")
+            caps.set_property("caps", Gst.Caps.from_string("audio/x-raw,channels=2"))
+            chain = (queue, vol, conv, caps)
+            for elem in chain:
+                pipeline.add(elem)
+                elem.sync_state_with_parent()
+            self.link_many(*chain)
+            pad.link(queue.get_static_pad("sink"))
+            sub_pad = submix.request_pad_simple("sink_%u")
+            caps.get_static_pad("src").link(sub_pad)
+            vol.set_property("volume", float(self.state[f"track_{n}_level"]))
+            self.elements[f"track_vol_{n}"] = vol
+
+        src.connect("pad-added", on_src_pad_added, None)
+        decode.connect("pad-added", on_decoded_pad_added, None)
+        deint.connect("pad-added", on_channel_pad_added, None)
+
     @staticmethod
     def make_element(factory: str, name: str) -> Gst.Element:
         elem = Gst.ElementFactory.make(factory, name)
@@ -525,12 +617,14 @@ class StudioMixer:
         cam_src.set_property("latency", 200)
         cam_src.set_property("drop-on-latency", True)
 
-        abl_src = self.make_element("rtspsrc", "abl_src")
-        abl_src.set_property("location", self.rtsp_url(ABLETON_PATH))
-        abl_src.set_property("protocols", "tcp")
-        abl_src.set_property("latency", 200)
-        abl_src.set_property("drop-on-latency", True)
-        abl_src.set_property("do-rtsp-keep-alive", True)
+        abl_src = None
+        if self.ableton_ready:
+            abl_src = self.make_element("rtspsrc", "abl_src")
+            abl_src.set_property("location", self.rtsp_url(ABLETON_PATH))
+            abl_src.set_property("protocols", "tcp")
+            abl_src.set_property("latency", 200)
+            abl_src.set_property("drop-on-latency", True)
+            abl_src.set_property("do-rtsp-keep-alive", True)
 
         cam_video_queue = self.make_delay_queue("cam_video_queue")
         depay = self.make_element("rtph264depay", "cam_h264_depay")
@@ -599,7 +693,6 @@ class StudioMixer:
 
         base_elems = [
             cam_src,
-            abl_src,
             depay,
             h264parse,
             cam_sel_queue,
@@ -630,6 +723,8 @@ class StudioMixer:
             aacparse,
             atee,
         ]
+        if abl_src:
+            base_elems.append(abl_src)
         for elem in base_elems:
             pipeline.add(elem)
 
@@ -730,7 +825,10 @@ class StudioMixer:
                 )
 
         cam_src.connect("pad-added", on_cam_pad_added, None)
-        abl_src.connect("pad-added", on_abl_pad_added, None)
+        if abl_src:
+            abl_src.connect("pad-added", on_abl_pad_added, None)
+        if self.tracks_ready:
+            self.add_tracks_branch(pipeline, mix, elements)
 
         self.elements = elements
         self.apply_state_to_elements()
@@ -805,15 +903,18 @@ class StudioMixer:
     def pipeline_thread(self) -> None:
         self._pipeline_thread_id = threading.get_ident()
         while not self._stop:
-            print("waiting for ableton (+ cam or fallback video)…", flush=True)
+            print("waiting for ableton or tracks (+ cam or fallback video)…", flush=True)
             while not self._stop and not self.sources_ready():
                 time.sleep(2)
             if self._stop:
                 return
-            if self.cam_ready:
-                print("sources live, starting pipeline with camera", flush=True)
-            else:
-                print("ableton live, starting pipeline with fallback video", flush=True)
+            audio = "+".join(
+                    n
+                    for n, up in (("ableton", self.ableton_ready), ("tracks", self.tracks_ready))
+                    if up
+                )
+            video = "camera" if self.cam_ready else "fallback video"
+            print(f"starting pipeline: audio={audio} video={video}", flush=True)
             self.main_loop = GLib.MainLoop()
             self.run_pipeline_once()
             print("pipeline stopped, retrying in 3s", flush=True)
@@ -877,6 +978,8 @@ class ControlHandler(SimpleHTTPRequestHandler):
                 updates[key] = max(800, min(4500, int(body[key])))
             elif key == "stream_audio_bitrate_kbps":
                 updates[key] = max(96, min(320, int(body[key])))
+            elif key.endswith("_name"):
+                updates[key] = str(body[key]).strip()[:24] or DEFAULT_STATE[key]
             elif key.endswith("_level"):
                 updates[key] = max(0.0, min(2.0, float(body[key])))
             else:

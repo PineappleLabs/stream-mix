@@ -58,6 +58,18 @@
     .warn { color: #ffb347; }
     .err { color: #ff7d7d; }
     .muted { color: #777; }
+    .track-row {
+      display: grid;
+      grid-template-columns: 8rem 1fr 3.5rem;
+      gap: 0.75rem;
+      align-items: center;
+      margin: 0.6rem 0;
+    }
+    .track-row input[type="text"] {
+      font: inherit; font-size: 0.85rem; padding: 0.25rem 0.4rem;
+      border-radius: 0.35rem; border: 1px solid #333; background: #222; color: #eee;
+      min-width: 0;
+    }
     .orient-row {
       display: grid;
       grid-template-columns: 1fr auto;
@@ -136,8 +148,18 @@
     <input type="range" id="ableton_audio_level" min="0" max="200" step="1" value="100">
   </label>
 
+  <h2>Tracks</h2>
+  <p class="sub" id="tracks-sub">8-channel feed from the laptop. Each fader sets one channel before the master mix.</p>
+  <label>Tracks audio delay <span class="val" id="v-tracks_audio_delay_ms">2500 ms</span>
+    <input type="range" id="tracks_audio_delay_ms" min="0" max="60000" step="100" value="2500">
+  </label>
+  <div id="tracks"></div>
+
   <script>
+    const NUM_TRACKS = 8;
+    const trackIds = Array.from({ length: NUM_TRACKS }, (_, i) => `track_${i + 1}_level`);
     const ids = [
+      'tracks_audio_delay_ms', ...trackIds,
       'gopro_video_delay_ms', 'gopro_audio_delay_ms', 'ableton_audio_delay_ms',
       'gopro_audio_level', 'ableton_audio_level', 'stream_video_bitrate_kbps',
     ];
@@ -149,6 +171,7 @@
 
     function fmt(id, value) {
       const el = document.getElementById('v-' + id);
+      if (!el) return;
       if (id.endsWith('_level')) el.textContent = value + '%';
       else if (id === 'stream_video_bitrate_kbps') el.textContent = value + ' kbps';
       else if (id.endsWith('_delay_ms') && value >= 1000) el.textContent = (value / 1000).toFixed(1) + ' s';
@@ -164,7 +187,7 @@
     }
 
     function sourcesReady(s) {
-      return s.ableton_ready && (s.cam_ready || s.fallback_video_available);
+      return (s.ableton_ready || s.tracks_ready) && (s.cam_ready || s.fallback_video_available);
     }
 
     function platformStatusText(platform, s) {
@@ -223,10 +246,17 @@
         fmt(id, val);
       }
       document.getElementById('video_rotation').value = String(s.video_rotation ?? 0);
+      for (let n = 1; n <= NUM_TRACKS; n++) {
+        const nameEl = document.getElementById(`track_${n}_name`);
+        if (document.activeElement !== nameEl) nameEl.value = s[`track_${n}_name`] ?? `Track ${n}`;
+      }
+      document.getElementById('tracks-sub').textContent = !s.tracks_configured
+        ? 'Not configured: set TRACKS_PATH on the container.'
+        : s.tracks_ready ? '8-channel feed live.' : '8-channel feed offline.';
       const st = document.getElementById('status');
       const pipe = s.pipeline_running ? 'running' : 'waiting for sources';
       const cls = s.pipeline_running ? 'ok' : 'warn';
-      st.innerHTML = `<span class="${cls}">Pipeline ${pipe}</span> · cam ${camStatusText(s)} · ableton ${s.ableton_ready ? 'live' : 'offline'}`;
+      st.innerHTML = `<span class="${cls}">Pipeline ${pipe}</span> · cam ${camStatusText(s)} · ableton ${s.ableton_ready ? 'live' : 'offline'} · tracks ${s.tracks_ready ? 'live' : 'offline'}`;
       updatePlatformUI(s);
     }
 
@@ -243,6 +273,9 @@
         body[id] = id.endsWith('_level') ? raw / 100 : raw;
         fmt(id, raw);
       }
+      for (let n = 1; n <= NUM_TRACKS; n++) {
+        body[`track_${n}_name`] = document.getElementById(`track_${n}_name`).value;
+      }
       body.video_rotation = Number(document.getElementById('video_rotation').value);
       await fetch('/api/state', {
         method: 'POST',
@@ -250,6 +283,17 @@
         body: JSON.stringify(body),
       });
       await loadState();
+    }
+
+    const tracksEl = document.getElementById('tracks');
+    for (let n = 1; n <= NUM_TRACKS; n++) {
+      const row = document.createElement('div');
+      row.className = 'track-row';
+      row.innerHTML = `<input type="text" id="track_${n}_name" maxlength="24" value="Track ${n}">
+        <input type="range" id="track_${n}_level" min="0" max="200" step="1" value="100">
+        <span class="val" id="v-track_${n}_level">100%</span>`;
+      tracksEl.appendChild(row);
+      row.querySelector('input[type="text"]').addEventListener('input', queueSave);
     }
 
     for (const id of ids) {
