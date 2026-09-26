@@ -17,7 +17,10 @@ Publishes to rtsp://<host>:8554/<path>; set TRACKS_PATH=<path> on the server.
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
+import threading
 import time
 
 import gi
@@ -66,7 +69,13 @@ def build_pipeline(args: argparse.Namespace) -> Gst.Pipeline:
 def run_once(args: argparse.Namespace) -> None:
     pipeline = build_pipeline(args)
     bus = pipeline.get_bus()
+    # rtspclientsink can block forever in set_state (e.g. mediamtx still holds a
+    # stale publisher session after a crash); die so the supervisor restarts us.
+    watchdog = threading.Timer(15, lambda: os._exit(2))
+    watchdog.start()
     pipeline.set_state(Gst.State.PLAYING)
+    pipeline.get_state(10 * Gst.SECOND)
+    watchdog.cancel()
     print(f"sending {CHANNELS}ch to rtsp://{args.host}:{args.port}/{args.path}", flush=True)
     try:
         while True:
@@ -90,7 +99,18 @@ def main() -> None:
     parser.add_argument("--path", default="tracks", help="must match TRACKS_PATH on the server")
     parser.add_argument("--source", choices=("jack", "wasapi", "test"), default="jack")
     parser.add_argument("--device", help="WASAPI device id (wasapi source only)")
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if not args.worker:
+        cmd = [sys.executable, os.path.abspath(__file__), *sys.argv[1:], "--worker"]
+        while True:
+            try:
+                subprocess.run(cmd, check=False)
+                print("sender exited; restarting in 3s", flush=True)
+                time.sleep(3)
+            except KeyboardInterrupt:
+                return
 
     Gst.init(None)
     for name in ("rtspclientsink", "rtpL16pay") + (
@@ -99,17 +119,12 @@ def main() -> None:
         if Gst.ElementFactory.find(name) is None:
             sys.exit(f"GStreamer element '{name}' not found; check your GStreamer install")
 
-    while True:
-        try:
-            run_once(args)
-        except KeyboardInterrupt:
-            return
-        except RuntimeError as exc:
-            print(f"stream error: {exc}; retrying in 3s", flush=True)
-            try:
-                time.sleep(3)
-            except KeyboardInterrupt:
-                return
+    try:
+        run_once(args)
+    except KeyboardInterrupt:
+        return
+    except RuntimeError as exc:
+        sys.exit(f"stream error: {exc}")
 
 
 if __name__ == "__main__":

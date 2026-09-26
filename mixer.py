@@ -79,6 +79,8 @@ class StudioMixer:
         self.cam_ready = False
         self.ableton_ready = False
         self.tracks_ready = False
+        self._tracks_in_pipeline = False
+        self._tracks_lost = False
         self.cam_using_fallback = False
         self.lock = threading.Lock()
         self._stop = False
@@ -423,11 +425,30 @@ class StudioMixer:
             0,
         )
 
+    def _check_tracks_feed(self, live: bool) -> None:
+        """rtspsrc never reconnects, so restart the pipeline when the feed returns."""
+        self.tracks_ready = live
+        if self._tracks_in_pipeline:
+            if not live:
+                self._tracks_lost = True
+            elif self._tracks_lost:
+                print("tracks feed returned, restarting pipeline", flush=True)
+                self._restart_pipeline()
+        elif live:
+            print("tracks feed appeared, restarting pipeline", flush=True)
+            self._restart_pipeline()
+
+    def _restart_pipeline(self) -> None:
+        if self.main_loop:
+            GLib.idle_add(self.main_loop.quit)
+
     def _monitor_sources(self) -> None:
         while not self._monitor_stop.wait(3):
             if not self.pipeline_running:
                 continue
             cam_live = self.probe_rtsp(CAM_PATH, timeout=3)
+            if TRACKS_PATH:
+                self._check_tracks_feed(self.probe_rtsp(TRACKS_PATH, timeout=3))
             with self.lock:
                 self.cam_ready = cam_live
                 if not self.pipeline or not self.elements:
@@ -827,6 +848,8 @@ class StudioMixer:
         cam_src.connect("pad-added", on_cam_pad_added, None)
         if abl_src:
             abl_src.connect("pad-added", on_abl_pad_added, None)
+        self._tracks_in_pipeline = self.tracks_ready
+        self._tracks_lost = False
         if self.tracks_ready:
             self.add_tracks_branch(pipeline, mix, elements)
 
