@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-libav \
     gstreamer1.0-rtsp \
     ffmpeg \
+    swh-plugins \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

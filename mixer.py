@@ -16,7 +16,8 @@ import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstVideo", "1.0")
-from gi.repository import Gst, GLib, GstVideo
+gi.require_version("GstAudio", "1.0")
+from gi.repository import Gst, GLib, GstAudio, GstVideo
 
 APP_DIR = Path("/app")
 STATE_PATH = Path(os.environ.get("STATE_PATH", "/config/mix-state.json"))
@@ -53,6 +54,16 @@ VIDEO_ROTATION_METHODS = {
 
 PLATFORM_SINKS = ("twitch", "youtube")
 MAX_DELAY_MS = 60_000
+
+# Master bus: drop the summed mix 6 dB, then catch the remaining overs with a
+# look-ahead limiter (gain reduction, not waveshaping) just under full scale.
+MASTER_HEADROOM = 0.5
+LIMIT_DB = -1.0
+LIMIT_RELEASE_S = 0.2
+# One float format for every summing stage, so nothing clips before the limiter.
+MIX_CAPS = "audio/x-raw,format=F32LE,rate=48000,channels=2"
+# How often to log packet loss and tracks clock drift.
+HEALTH_LOG_INTERVAL_S = 60
 
 MEDIAMTX_HOST = os.environ.get("MEDIAMTX_HOST", "mediamtx")
 MEDIAMTX_RTSP_PORT = os.environ.get("MEDIAMTX_RTSP_PORT", "8554")
@@ -93,6 +104,10 @@ class StudioMixer:
         self._vselector_fb_pad: Gst.Pad | None = None
         self._fb_parse_src: Gst.Pad | None = None
         self._pipeline_thread_id: int | None = None
+        # "<feed>/<session>" -> [rtpjitterbuffer, stats at the last log]
+        self._jitterbuffers: dict[str, list] = {}
+        # [first pts, frames seen, rate, bytes per frame, latest drift ns]
+        self._tracks_drift: list[int] | None = None
 
     def load_state(self) -> dict:
         if STATE_PATH.exists():
@@ -208,6 +223,112 @@ class StudioMixer:
         queue.set_property("max-size-bytes", 0)
         queue.set_property("max-size-time", ms_to_ns(MAX_DELAY_MS))
         return queue
+
+    def watch_jitterbuffers(self, src: Gst.Element, feed: str) -> None:
+        """Keep each rtspsrc jitterbuffer so its loss/late counters can be logged."""
+
+        def on_new_jitterbuffer(_bin, jitterbuffer, session, _ssrc) -> None:
+            self._jitterbuffers[f"{feed}/{session}"] = [jitterbuffer, None]
+
+        src.connect(
+            "new-manager",
+            lambda _src, manager: manager.connect("new-jitterbuffer", on_new_jitterbuffer),
+        )
+
+    def _measure_tracks_drift(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+        """Compare the feed's sample count with its timestamps (the server clock).
+
+        audiomixer counts samples and resyncs to the timestamps (dropping or
+        inserting audio, an audible click) once the two differ by more than its
+        alignment-threshold, so a steady drift here predicts periodic clicks.
+        """
+        buf = info.get_buffer()
+        if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+            return Gst.PadProbeReturn.OK
+        drift = self._tracks_drift
+        if drift is None:
+            caps = pad.get_current_caps()
+            audio = GstAudio.AudioInfo.new_from_caps(caps) if caps else None
+            if not audio:
+                return Gst.PadProbeReturn.OK
+            drift = self._tracks_drift = [buf.pts, 0, audio.rate, audio.bpf, 0]
+        first_pts, frames, rate, bpf, _ = drift
+        drift[4] = buf.pts - (first_pts + frames * Gst.SECOND // rate)
+        drift[1] = frames + buf.get_size() // bpf
+        return Gst.PadProbeReturn.OK
+
+    def log_audio_health(self) -> None:
+        for key, entry in list(self._jitterbuffers.items()):
+            jitterbuffer, last = entry
+            stats = jitterbuffer.get_property("stats")
+            now = {f: stats.get_value(f) for f in ("num-lost", "num-late")}
+            if last is not None:
+                lost = now["num-lost"] - last["num-lost"]
+                late = now["num-late"] - last["num-late"]
+                if lost or late:
+                    print(
+                        f"{key}: {lost} RTP packets lost, {late} arrived too late "
+                        f"in the last {HEALTH_LOG_INTERVAL_S}s (audible gaps)",
+                        flush=True,
+                    )
+            entry[1] = now
+        drift = self._tracks_drift
+        if drift is None or self._mix is None:
+            return
+        _, frames, rate, _, drift_ns = drift
+        elapsed_s = frames / rate
+        if elapsed_s < HEALTH_LOG_INTERVAL_S:
+            return
+        # Positive drift: fewer samples than the server clock expects (slow feed).
+        ppm = -drift_ns / (elapsed_s * Gst.SECOND) * 1e6
+        threshold_s = self._mix.get_property("alignment-threshold") / Gst.SECOND
+        every = (
+            f"a resync click every ~{threshold_s / (abs(ppm) * 1e-6) / 60:.0f} min"
+            if abs(ppm) >= 0.5
+            else "no resync clicks expected"
+        )
+        print(
+            f"tracks clock drift: {drift_ns / 1e6:+.1f} ms over {elapsed_s / 60:.0f} min "
+            f"({ppm:+.1f} ppm vs server) -> {every}",
+            flush=True,
+        )
+
+    def make_master_limiter(self) -> list[Gst.Element]:
+        """Headroom trim + look-ahead limiter, or the old soft clipper if it's not installed."""
+        factory = next(
+            (
+                f
+                for f in Gst.ElementFactory.list_get_elements(
+                    Gst.ELEMENT_FACTORY_TYPE_ANY, Gst.Rank.NONE
+                )
+                if f.get_name().lower().startswith("ladspa-")
+                and f.get_name().lower().endswith("fastlookaheadlimiter")
+            ),
+            None,
+        )
+        trim = self.make_element("volume", "limiter_trim")
+        trim.set_property("volume", MASTER_HEADROOM)
+        if factory is None:
+            print("look-ahead limiter (swh-plugins) not found; using rglimiter", flush=True)
+            # rglimiter soft-clips up to 0 dBFS; AAC overshoots a signal limited
+            # that hard, so the trim after it leaves 6 dB for the encoder.
+            return [self.make_element("rglimiter", "limiter"), trim]
+        limiter = factory.create("limiter")
+        # LADSPA properties are named after the port ("Input gain (dB)" -> input-gain).
+        for prefix, value in (
+            ("input-gain", 0.0),
+            ("limit", LIMIT_DB),
+            ("release", LIMIT_RELEASE_S),
+        ):
+            spec = next(
+                (p for p in limiter.list_properties() if p.name.lower().startswith(prefix)),
+                None,
+            )
+            if spec is None:
+                raise RuntimeError(f"{factory.get_name()} has no '{prefix}' property")
+            limiter.set_property(spec.name, value)
+        print(f"master limiter: {factory.get_name()} at {LIMIT_DB} dBFS", flush=True)
+        return [trim, limiter]
 
     def _flvmux_latency_ns(self) -> int:
         video_delay = int(self.state.get("gopro_video_delay_ms", 0))
@@ -509,9 +630,13 @@ class StudioMixer:
             GLib.idle_add(self.main_loop.quit)
 
     def _monitor_sources(self) -> None:
+        last_health_log = time.monotonic()
         while not self._monitor_stop.wait(3):
             if not self.pipeline_running:
                 continue
+            if time.monotonic() - last_health_log >= HEALTH_LOG_INTERVAL_S:
+                last_health_log = time.monotonic()
+                self.log_audio_health()
             cam_live = self.probe_rtsp(CAM_PATH, timeout=3)
             if TRACKS_PATH:
                 self._check_tracks_feed(self.probe_rtsp(TRACKS_PATH, timeout=3))
@@ -627,9 +752,12 @@ class StudioMixer:
         # The uncompressed feed arrives >200 ms late on a loaded host, and
         # drop-on-latency then discards most of it (silent program). The
         # tracks are already delayed seconds for A/V sync, so buffer generously.
-        src.set_property("latency", 1000)
-        src.set_property("drop-on-latency", True)
+        # TCP never loses packets, only bunches them up after a stall; keep the
+        # whole burst instead of dropping it (each drop is an audible click).
+        src.set_property("latency", 2000)
+        src.set_property("drop-on-latency", False)
         src.set_property("do-rtsp-keep-alive", True)
+        self.watch_jitterbuffers(src, "tracks")
         decode = self.make_element("decodebin", "tracks_decode")
         convert = self.make_element("audioconvert", "tracks_convert")
         float_caps = self.make_element("capsfilter", "tracks_float")
@@ -637,12 +765,18 @@ class StudioMixer:
         deint = self.make_element("deinterleave", "tracks_deint")
         submix = self.make_element("audiomixer", "tracks_submix")
         submix.set_property("start-time-selection", 1)
+        sub_caps = self.make_element("capsfilter", "tracks_submix_caps")
+        sub_caps.set_property("caps", Gst.Caps.from_string(MIX_CAPS))
         sub_queue = self.make_queue("tracks_queue")
-        self._tracks_elems = [src, decode, convert, float_caps, deint, submix, sub_queue]
+        self._tracks_elems = [src, decode, convert, float_caps, deint, submix, sub_caps, sub_queue]
         for elem in self._tracks_elems:
             pipeline.add(elem)
         self.link_many(convert, float_caps, deint)
-        self.link_many(submix, sub_queue)
+        self.link_many(submix, sub_caps, sub_queue)
+        self._tracks_drift = None
+        convert.get_static_pad("sink").add_probe(
+            Gst.PadProbeType.BUFFER, self._measure_tracks_drift
+        )
         mix_pad = mix.request_pad_simple("sink_%u")
         if not mix_pad:
             raise RuntimeError("failed to request audiomixer pad")
@@ -710,17 +844,23 @@ class StudioMixer:
         cam_src = self.make_element("rtspsrc", "cam_src")
         cam_src.set_property("location", self.rtsp_url(CAM_PATH))
         cam_src.set_property("protocols", "tcp")
+        # Kept short: this latency also delays the camera video. Late packets
+        # are still played rather than dropped (TCP only delays, never loses).
         cam_src.set_property("latency", 200)
-        cam_src.set_property("drop-on-latency", True)
+        cam_src.set_property("drop-on-latency", False)
+        self.watch_jitterbuffers(cam_src, "cam")
 
         abl_src = None
         if self.ableton_ready:
             abl_src = self.make_element("rtspsrc", "abl_src")
             abl_src.set_property("location", self.rtsp_url(ABLETON_PATH))
             abl_src.set_property("protocols", "tcp")
-            abl_src.set_property("latency", 200)
-            abl_src.set_property("drop-on-latency", True)
+            # Same as the tracks feed: audio only and delayed seconds for sync
+            # anyway, so buffer generously and never drop.
+            abl_src.set_property("latency", 2000)
+            abl_src.set_property("drop-on-latency", False)
             abl_src.set_property("do-rtsp-keep-alive", True)
+            self.watch_jitterbuffers(abl_src, "ableton")
 
         cam_video_queue = self.make_delay_queue("cam_video_queue")
         depay = self.make_element("rtph264depay", "cam_h264_depay")
@@ -764,15 +904,13 @@ class StudioMixer:
 
         mix = self.make_element("audiomixer", "mix")
         mix.set_property("start-time-selection", 1)
+        mix_caps = self.make_element("capsfilter", "mix_caps")
+        mix_caps.set_property("caps", Gst.Caps.from_string(MIX_CAPS))
 
-        # Soft-knee limiter on the master bus: summed tracks exceed full scale,
-        # and hard digital clipping in the AAC encode is heard as crackle.
+        # The summed program regularly exceeds full scale; limit it before AAC,
+        # where hard digital clipping is heard as crackle.
         lim_convert = self.make_element("audioconvert", "lim_convert")
-        limiter = self.make_element("rglimiter", "limiter")
-        # rglimiter's ceiling is 0 dBFS; AAC overshoots a signal limited that
-        # hard, so leave 6 dB of headroom for the encoder.
-        limiter_trim = self.make_element("volume", "limiter_trim")
-        limiter_trim.set_property("volume", 0.5)
+        limiter_chain = self.make_master_limiter()
         aconvert = self.make_element("audioconvert", "aconvert")
         aresample = self.make_element("audioresample", "aresample")
         aenc = self.make_element("avenc_aac", "aenc")
@@ -825,9 +963,9 @@ class StudioMixer:
             abl_audio_queue,
             abl_vol,
             mix,
+            mix_caps,
             lim_convert,
-            limiter,
-            limiter_trim,
+            *limiter_chain,
             aconvert,
             aresample,
             aenc,
@@ -866,7 +1004,9 @@ class StudioMixer:
             h264parse_out,
             vtee,
         )
-        self.link_many(mix, lim_convert, limiter, limiter_trim, aconvert, aresample, aenc, aacparse, atee)
+        self.link_many(
+            mix, mix_caps, lim_convert, *limiter_chain, aconvert, aresample, aenc, aacparse, atee
+        )
 
         def on_fb_event(_pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
             event = info.get_event()
@@ -1031,6 +1171,8 @@ class StudioMixer:
         self.pipeline = None
         self.elements = {}
         self._tracks_elems = []
+        self._jitterbuffers = {}
+        self._tracks_drift = None
         self._mix = None
         self._vselector_cam_pad = None
         self._vselector_fb_pad = None
