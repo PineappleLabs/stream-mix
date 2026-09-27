@@ -624,7 +624,10 @@ class StudioMixer:
         src = self.make_element("rtspsrc", "tracks_src")
         src.set_property("location", self.rtsp_url(TRACKS_PATH))
         src.set_property("protocols", "tcp")
-        src.set_property("latency", 200)
+        # The uncompressed feed arrives >200 ms late on a loaded host, and
+        # drop-on-latency then discards most of it (silent program). The
+        # tracks are already delayed seconds for A/V sync, so buffer generously.
+        src.set_property("latency", 1000)
         src.set_property("drop-on-latency", True)
         src.set_property("do-rtsp-keep-alive", True)
         decode = self.make_element("decodebin", "tracks_decode")
