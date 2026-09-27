@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .env
 stream-keys.env
+sender/settings.local.ps1
+sender/stream_tracks.bat
