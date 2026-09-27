@@ -42,16 +42,26 @@ MASK = "channel-mask=(bitmask)0x0"
 SEND_BUFFER_S = 2
 CAPTURE_BUFFER_S = 1
 
-# rtpopuspay only takes channel-mapping-family 1, which for 8 channels means
-# 7.1 surround, and a 7.1 encode low-passes the LFE channel. So encode family
-# 255 (8 independent mono streams, no LFE) and relabel it as family 1 for the
-# payloader. The receiver's decoder then reorders 7.1 Vorbis order into
-# GStreamer order; pre-apply the inverse so tracks arrive as 1..8.
-OPUS_ORDER = (0, 2, 1, 6, 7, 4, 5, 3)
-OPUS_MATRIX = "<" + ",".join(
-    "<" + ",".join("(float)1" if col == src else "(float)0" for col in range(CHANNELS)) + ">"
-    for src in OPUS_ORDER
-) + ">"
+# The receiver treats any 8-channel feed as 7.1 surround and reorders it into
+# GStreamer's 7.1 order, which moves tracks 5-8 (and for Opus, more). Send each
+# track on the wire channel that the reorder maps back to its own slot, so the
+# mixer sees tracks 1..8 in order. WIRE_ORDER[codec][wire channel] = track.
+#
+# rtpopuspay also only takes channel-mapping-family 1, and a real 7.1 encode
+# low-passes the LFE channel. So Opus is encoded as family 255 (8 independent
+# mono streams, no LFE) and only relabelled as family 1 for the payloader.
+WIRE_ORDER = {
+    "pcm": (0, 1, 2, 3, 6, 7, 4, 5),
+    "opus": (0, 2, 1, 6, 7, 4, 5, 3),
+}
+
+
+def wire_matrix(codec: str) -> str:
+    """audioconvert mix-matrix that routes each track onto its wire channel."""
+    return "<" + ",".join(
+        "<" + ",".join("(float)1" if col == track else "(float)0" for col in range(CHANNELS)) + ">"
+        for track in WIRE_ORDER[codec]
+    ) + ">"
 
 
 def build_source(args: argparse.Namespace) -> str:
@@ -83,10 +93,13 @@ def log(message: str) -> None:
 
 def build_encoder(args: argparse.Namespace) -> tuple[str, str]:
     """Return (raw audio -> encoded pipeline fragment, RTP payloader name)."""
+    reorder = (
+        f"! audio/x-raw,format=F32LE,rate={RATE},channels={CHANNELS},{MASK} "
+        f'! audioconvert mix-matrix="{wire_matrix(args.codec)}" '
+    )
     if args.codec == "opus":
         return (
-            f'! audio/x-raw,format=F32LE,rate={RATE},channels={CHANNELS},{MASK} '
-            f'! audioconvert mix-matrix="{OPUS_MATRIX}" '
+            f"{reorder}"
             f"! audio/x-raw,channels={CHANNELS},{MASK} "
             f"! opusenc bitrate={args.opus_kbps * 1000} bitrate-type=vbr "
             # 10 ms frames keep packets under the MTU at full bitrate.
@@ -95,7 +108,7 @@ def build_encoder(args: argparse.Namespace) -> tuple[str, str]:
             "rtpopuspay",
         )
     fmt, pay = ("S24BE", "rtpL24pay") if args.bit_depth == 24 else ("S16BE", "rtpL16pay")
-    return f"! audio/x-raw,format={fmt},rate={RATE},channels={CHANNELS},{MASK} ", pay
+    return f"{reorder}! audio/x-raw,format={fmt},rate={RATE},channels={CHANNELS},{MASK} ", pay
 
 
 def build_pipeline(args: argparse.Namespace) -> Gst.Pipeline:
