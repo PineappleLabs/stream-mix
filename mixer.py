@@ -22,7 +22,7 @@ APP_DIR = Path("/app")
 STATE_PATH = Path(os.environ.get("STATE_PATH", "/config/mix-state.json"))
 STATIC_DIR = APP_DIR / "static"
 FALLBACK_VIDEO = Path(
-    os.environ.get("FALLBACK_VIDEO_PATH", "/app/assets/citadelSkullVisualizer.mp4")
+    os.environ.get("FALLBACK_VIDEO_PATH", "/app/assets/fallback.mp4")
 )
 
 NUM_TRACKS = 8
@@ -91,6 +91,7 @@ class StudioMixer:
         self._monitor_stop = threading.Event()
         self._vselector_cam_pad: Gst.Pad | None = None
         self._vselector_fb_pad: Gst.Pad | None = None
+        self._fb_parse_src: Gst.Pad | None = None
         self._pipeline_thread_id: int | None = None
 
     def load_state(self) -> dict:
@@ -419,15 +420,36 @@ class StudioMixer:
         label = "fallback video" if use_fallback else "camera"
         print(f"video source: {label}", flush=True)
 
-    def loop_fallback_video(self) -> None:
-        filesrc = self.elements.get("fb_filesrc")
-        if not filesrc:
+    @staticmethod
+    def drop_eos(_pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+        """A lost input must not send EOS into the shared encoder/mixer and end the program."""
+        event = info.get_event()
+        if event is not None and event.type == Gst.EventType.EOS:
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.OK
+
+    def align_fallback_clock(self) -> None:
+        """The file's timestamps start at 0; shift them onto the live pipeline clock."""
+        pad = self._fb_parse_src
+        clock = self.pipeline.get_clock() if self.pipeline else None
+        if pad is None or clock is None:
             return
-        filesrc.seek_simple(
-            Gst.Format.TIME,
-            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-            0,
-        )
+        now = clock.get_time() - self.pipeline.get_base_time()
+        pad.set_offset(now)
+
+    def loop_fallback_video(self) -> bool:
+        """Restart the file source instead of seeking (qtdemux seeks stall on fragmented MP4)."""
+        filesrc = self.elements.get("fb_filesrc")
+        demux = self.elements.get("fb_demux")
+        if not (filesrc and demux):
+            return False
+        filesrc.set_state(Gst.State.NULL)
+        demux.set_state(Gst.State.NULL)
+        self.align_fallback_clock()
+        filesrc.set_state(Gst.State.READY)
+        demux.set_state(Gst.State.PLAYING)
+        filesrc.set_state(Gst.State.PLAYING)
+        return False
 
     def _check_tracks_feed(self, live: bool) -> None:
         """rtspsrc never reconnects, so rebuild just the tracks branch when the feed returns."""
@@ -504,6 +526,7 @@ class StudioMixer:
                 elif cam_live and self.cam_using_fallback:
                     GLib.idle_add(self.select_video_source, False)
                 elif not cam_live and not self.cam_using_fallback and self.fallback_available():
+                    self._cam_src_dead = True
                     GLib.idle_add(self.select_video_source, True)
 
     def _start_monitor(self) -> None:
@@ -520,11 +543,6 @@ class StudioMixer:
         # Any cam RTSP branch (video or mic) may error when the GoPro drops; keep
         # Ableton audio and fallback video running instead of stopping the pipeline.
         return name == "h264parse" or name.startswith("cam_")
-
-    def _is_fallback_element(self, element: Gst.Element | None) -> bool:
-        if element is None:
-            return False
-        return element.get_name().startswith("fb_")
 
     def _is_platform_sink_element(self, element: Gst.Element | None) -> bool:
         if element is None:
@@ -627,14 +645,7 @@ class StudioMixer:
             raise RuntimeError("failed to request audiomixer pad")
         sub_src = sub_queue.get_static_pad("src")
 
-        def drop_eos(_pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
-            event = info.get_event()
-            if event is not None and event.type == Gst.EventType.EOS:
-                return Gst.PadProbeReturn.DROP
-            return Gst.PadProbeReturn.OK
-
-        # A dropped feed must not EOS the master mix (that would end the whole program).
-        sub_src.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, drop_eos)
+        sub_src.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.drop_eos)
         sub_src.link(mix_pad)
         mix_pad.set_property("offset", ms_to_ns(int(self.state["tracks_audio_delay_ms"])))
         elements["tracks_mix_pad"] = mix_pad
@@ -718,6 +729,8 @@ class StudioMixer:
         fb_filesrc.set_property("location", str(FALLBACK_VIDEO))
         fb_demux = self.make_element("qtdemux", "fb_demux")
         fb_h264parse = self.make_element("h264parse", "fb_h264parse")
+        fb_sync = self.make_element("identity", "fb_sync")
+        fb_sync.set_property("sync", True)
         fb_video_queue = self.make_queue("fb_video_queue")
 
         h264parse_post = self.make_element("h264parse", "h264parse_post")
@@ -766,6 +779,7 @@ class StudioMixer:
                 "abl_vol": abl_vol,
                 "vselector": vselector,
                 "fb_filesrc": fb_filesrc,
+                "fb_demux": fb_demux,
                 "videoflip": videoflip,
                 "venc": venc,
                 "aenc": aenc,
@@ -792,6 +806,7 @@ class StudioMixer:
             fb_filesrc,
             fb_demux,
             fb_h264parse,
+            fb_sync,
             fb_video_queue,
             vtee,
             cam_audio_queue,
@@ -812,12 +827,16 @@ class StudioMixer:
 
         self.link_many(depay, h264parse, cam_sel_queue)
         self.link_many(fb_filesrc, fb_demux)
-        self.link_many(fb_h264parse, fb_video_queue)
+        self.link_many(fb_h264parse, fb_sync, fb_video_queue)
+        fb_parse_src = fb_h264parse.get_static_pad("src")
+        self._fb_parse_src = fb_parse_src
         self._vselector_cam_pad = vselector.request_pad_simple("sink_%u")
         self._vselector_fb_pad = vselector.request_pad_simple("sink_%u")
         if not self._vselector_cam_pad or not self._vselector_fb_pad:
             raise RuntimeError("failed to request input-selector pads")
-        cam_sel_queue.get_static_pad("src").link(self._vselector_cam_pad)
+        cam_sel_src = cam_sel_queue.get_static_pad("src")
+        cam_sel_src.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.drop_eos)
+        cam_sel_src.link(self._vselector_cam_pad)
         fb_video_queue.get_static_pad("src").link(self._vselector_fb_pad)
         self.link_many(
             vselector,
@@ -835,18 +854,29 @@ class StudioMixer:
         )
         self.link_many(mix, aconvert, aresample, aenc, aacparse, atee)
 
+        def on_fb_event(_pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+            event = info.get_event()
+            if event is not None and event.type == Gst.EventType.EOS:
+                # Loop here so the file's EOS never reaches (and ends) the program.
+                GLib.timeout_add(100, self.loop_fallback_video)
+                return Gst.PadProbeReturn.DROP
+            return Gst.PadProbeReturn.OK
+
         def on_fb_pad_added(_demux: Gst.Element, pad: Gst.Pad, _user_data: object) -> None:
             caps = pad.get_current_caps()
             if not caps:
                 return
             media = caps.get_structure(0).get_name()
             if media.startswith("video/"):
+                pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, on_fb_event)
                 pad.link(fb_h264parse.get_static_pad("sink"))
             elif media.startswith("audio/"):
                 # Drop the visualizer's embedded audio; program audio is Ableton + cam mic.
-                fb_audio_sink = self.make_element("fakesink", "fb_audio_sink")
-                pipeline.add(fb_audio_sink)
-                fb_audio_sink.sync_state_with_parent()
+                fb_audio_sink = pipeline.get_by_name("fb_audio_sink")
+                if fb_audio_sink is None:
+                    fb_audio_sink = self.make_element("fakesink", "fb_audio_sink")
+                    pipeline.add(fb_audio_sink)
+                    fb_audio_sink.sync_state_with_parent()
                 pad.link(fb_audio_sink.get_static_pad("sink"))
 
         fb_demux.connect("pad-added", on_fb_pad_added, None)
@@ -950,10 +980,6 @@ class StudioMixer:
             if self.main_loop:
                 self.main_loop.quit()
         elif msg_type == Gst.MessageType.EOS:
-            if self._is_fallback_element(src):
-                print("fallback video ended, looping", flush=True)
-                GLib.idle_add(self.loop_fallback_video)
-                return
             print("pipeline EOS", flush=True)
             self.pipeline_running = False
             if self.main_loop:
@@ -968,6 +994,7 @@ class StudioMixer:
         bus.add_signal_watch()
         bus.connect("message", self.on_bus_message)
         self.pipeline.set_state(Gst.State.PLAYING)
+        self.align_fallback_clock()
         self.select_video_source(self.cam_using_fallback)
         self.pipeline_running = True
         for platform in PLATFORM_SINKS:
@@ -993,6 +1020,7 @@ class StudioMixer:
         self._mix = None
         self._vselector_cam_pad = None
         self._vselector_fb_pad = None
+        self._fb_parse_src = None
         self.pipeline_running = False
         self.cam_using_fallback = False
 

@@ -18,8 +18,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY mixer.py /app/mixer.py
 COPY static/ /app/static/
-COPY assets/citadelSkullVisualizer.mp4 /app/assets/citadelSkullVisualizer.mp4
-RUN chmod 644 /app/assets/citadelSkullVisualizer.mp4
+COPY assets/citadelSkullVisualizer.mp4 /tmp/citadelSkullVisualizer.mp4
+# The source MP4 is oddly fragmented and qtdemux can't restart it to loop; a plain
+# faststart remux (video only, no re-encode) loops cleanly.
+RUN mkdir -p /app/assets && ffmpeg -v error -y -i /tmp/citadelSkullVisualizer.mp4 -map 0:v -c copy -movflags +faststart /app/assets/fallback.mp4 \
+    && chmod 644 /app/assets/fallback.mp4 && rm /tmp/citadelSkullVisualizer.mp4
 
 ENV PYTHONUNBUFFERED=1
 CMD ["python3", "/app/mixer.py"]
