@@ -765,6 +765,14 @@ class StudioMixer:
         mix = self.make_element("audiomixer", "mix")
         mix.set_property("start-time-selection", 1)
 
+        # Soft-knee limiter on the master bus: summed tracks exceed full scale,
+        # and hard digital clipping in the AAC encode is heard as crackle.
+        lim_convert = self.make_element("audioconvert", "lim_convert")
+        limiter = self.make_element("rglimiter", "limiter")
+        # rglimiter's ceiling is 0 dBFS; AAC overshoots a signal limited that
+        # hard, so leave 6 dB of headroom for the encoder.
+        limiter_trim = self.make_element("volume", "limiter_trim")
+        limiter_trim.set_property("volume", 0.5)
         aconvert = self.make_element("audioconvert", "aconvert")
         aresample = self.make_element("audioresample", "aresample")
         aenc = self.make_element("avenc_aac", "aenc")
@@ -817,6 +825,9 @@ class StudioMixer:
             abl_audio_queue,
             abl_vol,
             mix,
+            lim_convert,
+            limiter,
+            limiter_trim,
             aconvert,
             aresample,
             aenc,
@@ -855,7 +866,7 @@ class StudioMixer:
             h264parse_out,
             vtee,
         )
-        self.link_many(mix, aconvert, aresample, aenc, aacparse, atee)
+        self.link_many(mix, lim_convert, limiter, limiter_trim, aconvert, aresample, aenc, aacparse, atee)
 
         def on_fb_event(_pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
             event = info.get_event()
