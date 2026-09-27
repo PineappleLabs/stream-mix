@@ -81,6 +81,10 @@ class StudioMixer:
         self.tracks_ready = False
         self._tracks_in_pipeline = False
         self._tracks_lost = False
+        self._tracks_misses = 0
+        self._tracks_elems: list[Gst.Element] = []
+        self._mix: Gst.Element | None = None
+        self._cam_src_dead = False
         self.cam_using_fallback = False
         self.lock = threading.Lock()
         self._stop = False
@@ -426,17 +430,57 @@ class StudioMixer:
         )
 
     def _check_tracks_feed(self, live: bool) -> None:
-        """rtspsrc never reconnects, so restart the pipeline when the feed returns."""
+        """rtspsrc never reconnects, so rebuild just the tracks branch when the feed returns."""
         self.tracks_ready = live
-        if self._tracks_in_pipeline:
-            if not live:
+        if not self._tracks_in_pipeline:
+            if live:
+                print("tracks feed appeared, attaching", flush=True)
+                self._schedule(self._rebuild_tracks_branch)
+            return
+        if live:
+            self._tracks_misses = 0
+            if self._tracks_lost:
+                print("tracks feed returned, reconnecting", flush=True)
+                self._schedule(self._rebuild_tracks_branch)
+        else:
+            self._tracks_misses += 1
+            if self._tracks_misses >= 2:
                 self._tracks_lost = True
-            elif self._tracks_lost:
-                print("tracks feed returned, restarting pipeline", flush=True)
-                self._restart_pipeline()
-        elif live:
-            print("tracks feed appeared, restarting pipeline", flush=True)
-            self._restart_pipeline()
+
+    def _schedule(self, fn) -> None:
+        GLib.idle_add(lambda: (fn(), False)[1])
+
+    def _in_tracks_branch(self, element: Gst.Element | None) -> bool:
+        while element is not None:
+            if element in self._tracks_elems:
+                return True
+            element = element.get_parent()
+        return False
+
+    def _teardown_tracks_branch(self) -> None:
+        if not self.pipeline:
+            return
+        mix_pad = self.elements.pop("tracks_mix_pad", None)
+        for elem in reversed(self._tracks_elems):
+            elem.set_state(Gst.State.NULL)
+            self.pipeline.remove(elem)
+        self._tracks_elems = []
+        if mix_pad is not None and self._mix is not None:
+            self._mix.release_request_pad(mix_pad)
+        for i in range(1, NUM_TRACKS + 1):
+            self.elements.pop(f"track_vol_{i}", None)
+
+    def _rebuild_tracks_branch(self) -> None:
+        if not self.pipeline or self._mix is None or not self.pipeline_running:
+            return
+        self._teardown_tracks_branch()
+        self.add_tracks_branch(self.pipeline, self._mix, self.elements)
+        for elem in reversed(self._tracks_elems):
+            elem.set_state(Gst.State.PLAYING)
+        self._tracks_in_pipeline = True
+        self._tracks_lost = False
+        self._tracks_misses = 0
+        self.apply_state_to_elements()
 
     def _restart_pipeline(self) -> None:
         if self.main_loop:
@@ -453,7 +497,11 @@ class StudioMixer:
                 self.cam_ready = cam_live
                 if not self.pipeline or not self.elements:
                     continue
-                if cam_live and self.cam_using_fallback:
+                if cam_live and self._cam_src_dead:
+                    print("camera came back, restarting pipeline", flush=True)
+                    self._cam_src_dead = False
+                    self._restart_pipeline()
+                elif cam_live and self.cam_using_fallback:
                     GLib.idle_add(self.select_video_source, False)
                 elif not cam_live and not self.cam_using_fallback and self.fallback_available():
                     GLib.idle_add(self.select_video_source, True)
@@ -569,14 +617,25 @@ class StudioMixer:
         submix = self.make_element("audiomixer", "tracks_submix")
         submix.set_property("start-time-selection", 1)
         sub_queue = self.make_queue("tracks_queue")
-        for elem in (src, decode, convert, float_caps, deint, submix, sub_queue):
+        self._tracks_elems = [src, decode, convert, float_caps, deint, submix, sub_queue]
+        for elem in self._tracks_elems:
             pipeline.add(elem)
         self.link_many(convert, float_caps, deint)
         self.link_many(submix, sub_queue)
         mix_pad = mix.request_pad_simple("sink_%u")
         if not mix_pad:
             raise RuntimeError("failed to request audiomixer pad")
-        sub_queue.get_static_pad("src").link(mix_pad)
+        sub_src = sub_queue.get_static_pad("src")
+
+        def drop_eos(_pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+            event = info.get_event()
+            if event is not None and event.type == Gst.EventType.EOS:
+                return Gst.PadProbeReturn.DROP
+            return Gst.PadProbeReturn.OK
+
+        # A dropped feed must not EOS the master mix (that would end the whole program).
+        sub_src.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, drop_eos)
+        sub_src.link(mix_pad)
         mix_pad.set_property("offset", ms_to_ns(int(self.state["tracks_audio_delay_ms"])))
         elements["tracks_mix_pad"] = mix_pad
 
@@ -598,6 +657,7 @@ class StudioMixer:
                 sink = self.make_element("fakesink", f"tracks_extra_sink_{idx}")
                 pipeline.add(sink)
                 sink.sync_state_with_parent()
+                self._tracks_elems.append(sink)
                 pad.link(sink.get_static_pad("sink"))
                 return
             n = idx + 1
@@ -610,6 +670,7 @@ class StudioMixer:
             for elem in chain:
                 pipeline.add(elem)
                 elem.sync_state_with_parent()
+                self._tracks_elems.append(elem)
             self.link_many(*chain)
             pad.link(queue.get_static_pad("sink"))
             sub_pad = submix.request_pad_simple("sink_%u")
@@ -848,8 +909,11 @@ class StudioMixer:
         cam_src.connect("pad-added", on_cam_pad_added, None)
         if abl_src:
             abl_src.connect("pad-added", on_abl_pad_added, None)
+        self._mix = mix
         self._tracks_in_pipeline = self.tracks_ready
         self._tracks_lost = False
+        self._tracks_misses = 0
+        self._cam_src_dead = False
         if self.tracks_ready:
             self.add_tracks_branch(pipeline, mix, elements)
 
@@ -863,6 +927,13 @@ class StudioMixer:
         if msg_type == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             print(f"pipeline error: {err} ({debug})", flush=True)
+            if self._in_tracks_branch(src):
+                self._tracks_lost = True
+                if self.pipeline:
+                    self.pipeline.set_state(Gst.State.PLAYING)
+                return
+            if self._is_cam_element(src):
+                self._cam_src_dead = True
             if self._is_cam_element(src) and self.fallback_available():
                 GLib.idle_add(self.select_video_source, True)
                 if self.pipeline:
@@ -918,6 +989,8 @@ class StudioMixer:
             self.pipeline.set_state(Gst.State.NULL)
         self.pipeline = None
         self.elements = {}
+        self._tracks_elems = []
+        self._mix = None
         self._vselector_cam_pad = None
         self._vselector_fb_pad = None
         self.pipeline_running = False
