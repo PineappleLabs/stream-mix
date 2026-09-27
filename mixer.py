@@ -35,8 +35,13 @@ DEFAULT_STATE = {
     "tracks_audio_delay_ms": 2500,
     "gopro_audio_level": 0.25,
     "ableton_audio_level": 1.0,
+    "gopro_audio_muted": False,
+    "ableton_audio_muted": False,
     **{f"track_{i}_level": 1.0 for i in range(1, NUM_TRACKS + 1)},
     **{f"track_{i}_name": f"Track {i}" for i in range(1, NUM_TRACKS + 1)},
+    **{f"track_{i}_muted": False for i in range(1, NUM_TRACKS + 1)},
+    # 0 = no solo; otherwise the one track number that plays alone.
+    "solo_track": 0,
     "twitch_enabled": False,
     "youtube_enabled": False,
     "video_rotation": 0,
@@ -58,6 +63,10 @@ MAX_DELAY_MS = 60_000
 # Master bus: drop the summed mix 6 dB, then catch the remaining overs with a
 # look-ahead limiter (gain reduction, not waveshaping) just under full scale.
 MASTER_HEADROOM = 0.5
+
+# A missing Ableton feed is only rebuilt by restarting the pipeline; don't do that
+# more often than this.
+ABLETON_RESTART_COOLDOWN_S = 60
 LIMIT_DB = -1.0
 LIMIT_RELEASE_S = 0.2
 # One float format for every summing stage, so nothing clips before the limiter.
@@ -94,6 +103,10 @@ class StudioMixer:
         self._tracks_lost = False
         self._tracks_misses = 0
         self._tracks_elems: list[Gst.Element] = []
+        self._abl_in_pipeline = False
+        self._abl_lost = False
+        self._abl_misses = 0
+        self._abl_last_restart = 0.0
         self._mix: Gst.Element | None = None
         self._cam_src_dead = False
         self.cam_using_fallback = False
@@ -160,7 +173,8 @@ class StudioMixer:
         self.cam_ready = self.probe_rtsp(CAM_PATH)
         self.ableton_ready = self.probe_rtsp(ABLETON_PATH)
         self.tracks_ready = bool(TRACKS_PATH) and self.probe_rtsp(TRACKS_PATH)
-        audio_ready = self.ableton_ready or self.tracks_ready
+        # The GoPro mic is the last-resort audio source.
+        audio_ready = self.ableton_ready or self.tracks_ready or self.cam_ready
         return audio_ready and (self.cam_ready or self.fallback_available())
 
     def platform_configured(self, platform: str) -> bool:
@@ -354,10 +368,6 @@ class StudioMixer:
             "abl_mix_pad": "ableton_audio_delay_ms",
             "tracks_mix_pad": "tracks_audio_delay_ms",
         }
-        level_map = {
-            "cam_vol": "gopro_audio_level",
-            "abl_vol": "ableton_audio_level",
-        }
         for elem_name, state_key in delay_map.items():
             elem = self.elements.get(elem_name)
             if elem:
@@ -368,17 +378,14 @@ class StudioMixer:
             if mix_pad:
                 delay_ms = int(self.state[state_key])
                 mix_pad.set_property("offset", ms_to_ns(delay_ms))
-        for elem_name, state_key in level_map.items():
+        for elem_name in ("cam_vol", "abl_vol"):
             elem = self.elements.get(elem_name)
             if elem:
-                if elem_name == "cam_vol" and self.cam_using_fallback:
-                    elem.set_property("volume", 0.0)
-                else:
-                    elem.set_property("volume", float(self.state[state_key]))
+                elem.set_property("volume", self.source_volume(elem_name))
         for i in range(1, NUM_TRACKS + 1):
             elem = self.elements.get(f"track_vol_{i}")
             if elem:
-                elem.set_property("volume", float(self.state[f"track_{i}_level"]))
+                elem.set_property("volume", self.track_volume(i))
         for platform in PLATFORM_SINKS:
             enabled = bool(self.state.get(f"{platform}_enabled"))
             self._set_platform_valve(platform, drop=not enabled)
@@ -394,6 +401,51 @@ class StudioMixer:
         if aenc:
             aenc.set_property("bitrate", int(self.state.get("stream_audio_bitrate_kbps", 160)) * 1000)
         self._apply_flvmux_latency()
+
+    def source_volume(self, elem_name: str) -> float:
+        """Effective gain for the GoPro mic (cam_vol) or Ableton stereo (abl_vol)."""
+        if elem_name == "cam_vol":
+            if self.cam_using_fallback or self.state.get("gopro_audio_muted"):
+                return 0.0
+            return float(self.state["gopro_audio_level"])
+        if self.state.get("ableton_audio_muted"):
+            return 0.0
+        return float(self.state["ableton_audio_level"])
+
+    def live_audio_source(self) -> str:
+        """Highest-priority audio source that is arriving: tracks > ableton > gopro mic."""
+        if self._tracks_in_pipeline and not self._tracks_lost:
+            return "tracks"
+        if self._abl_in_pipeline and not self._abl_lost and self._abl_misses < 2:
+            return "ableton"
+        if self.cam_ready and not self.cam_using_fallback:
+            return "gopro"
+        return "none"
+
+    def _update_audio_source(self) -> None:
+        """On a change of live source, unmute it and mute the others. Call with the lock held.
+
+        Mutes are only flipped on a change, so a manual unmute (e.g. the GoPro mic
+        layered over the tracks) sticks until the next failover. The last source is
+        persisted so a restart doesn't undo manual mutes either.
+        """
+        source = self.live_audio_source()
+        if source == self.state.get("audio_source"):
+            return
+        print(f"audio source: {self.state.get('audio_source')} -> {source}", flush=True)
+        self.state["audio_source"] = source
+        if source != "none":
+            self.state["ableton_audio_muted"] = source != "ableton"
+            self.state["gopro_audio_muted"] = source != "gopro"
+        self.save_state()
+        self.apply_state_to_elements()
+
+    def track_volume(self, n: int) -> float:
+        """Effective gain for track n: its saved level unless muted or soloed out."""
+        solo = int(self.state.get("solo_track", 0))
+        if self.state.get(f"track_{n}_muted") or (solo and solo != n):
+            return 0.0
+        return float(self.state[f"track_{n}_level"])
 
     def update_state(self, new_state: dict) -> None:
         with self.lock:
@@ -517,6 +569,7 @@ class StudioMixer:
             "tracks_configured": bool(TRACKS_PATH),
             "tracks_ready": self.tracks_ready,
             "cam_using_fallback": self.cam_using_fallback,
+            "audio_source": self.state.get("audio_source", "none") if self.pipeline_running else "none",
             "fallback_video_available": self.fallback_available(),
             "twitch_configured": self.platform_configured("twitch"),
             "youtube_configured": self.platform_configured("youtube"),
@@ -536,8 +589,7 @@ class StudioMixer:
         self.cam_using_fallback = use_fallback
         cam_vol = self.elements.get("cam_vol")
         if cam_vol:
-            level = 0.0 if use_fallback else float(self.state["gopro_audio_level"])
-            cam_vol.set_property("volume", level)
+            cam_vol.set_property("volume", self.source_volume("cam_vol"))
         label = "fallback video" if use_fallback else "camera"
         print(f"video source: {label}", flush=True)
 
@@ -590,6 +642,20 @@ class StudioMixer:
             if self._tracks_misses >= 2:
                 self._tracks_lost = True
 
+    def _check_ableton_feed(self, live: bool) -> None:
+        """Track Ableton liveness; restart to pick it up if it's needed but not in the pipeline."""
+        self.ableton_ready = live
+        self._abl_misses = 0 if live else self._abl_misses + 1
+        usable = self._abl_in_pipeline and not self._abl_lost
+        tracks_up = self._tracks_in_pipeline and not self._tracks_lost
+        if not live or usable or tracks_up:
+            return
+        if time.monotonic() - self._abl_last_restart < ABLETON_RESTART_COOLDOWN_S:
+            return
+        print("tracks down and ableton is back, restarting pipeline to attach it", flush=True)
+        self._abl_last_restart = time.monotonic()
+        self._restart_pipeline()
+
     def _schedule(self, fn) -> None:
         GLib.idle_add(lambda: (fn(), False)[1])
 
@@ -640,10 +706,12 @@ class StudioMixer:
             cam_live = self.probe_rtsp(CAM_PATH, timeout=3)
             if TRACKS_PATH:
                 self._check_tracks_feed(self.probe_rtsp(TRACKS_PATH, timeout=3))
+            self._check_ableton_feed(self.probe_rtsp(ABLETON_PATH, timeout=3))
             with self.lock:
                 self.cam_ready = cam_live
                 if not self.pipeline or not self.elements:
                     continue
+                self._update_audio_source()
                 if cam_live and self._cam_src_dead:
                     print("camera came back, restarting pipeline", flush=True)
                     self._cam_src_dead = False
@@ -668,6 +736,14 @@ class StudioMixer:
         # Any cam RTSP branch (video or mic) may error when the GoPro drops; keep
         # Ableton audio and fallback video running instead of stopping the pipeline.
         return name == "h264parse" or name.startswith("cam_")
+
+    @staticmethod
+    def _is_abl_element(element: Gst.Element | None) -> bool:
+        while element is not None:
+            if element.get_name().startswith("abl_"):
+                return True
+            element = element.get_parent()
+        return False
 
     def _is_platform_sink_element(self, element: Gst.Element | None) -> bool:
         if element is None:
@@ -823,7 +899,7 @@ class StudioMixer:
             pad.link(queue.get_static_pad("sink"))
             sub_pad = submix.request_pad_simple("sink_%u")
             caps.get_static_pad("src").link(sub_pad)
-            vol.set_property("volume", float(self.state[f"track_{n}_level"]))
+            vol.set_property("volume", self.track_volume(n))
             self.elements[f"track_vol_{n}"] = vol
 
         src.connect("pad-added", on_src_pad_added, None)
@@ -1094,6 +1170,9 @@ class StudioMixer:
         if abl_src:
             abl_src.connect("pad-added", on_abl_pad_added, None)
         self._mix = mix
+        self._abl_in_pipeline = abl_src is not None
+        self._abl_lost = False
+        self._abl_misses = 0
         self._tracks_in_pipeline = self.tracks_ready
         self._tracks_lost = False
         self._tracks_misses = 0
@@ -1113,6 +1192,12 @@ class StudioMixer:
             print(f"pipeline error: {err} ({debug})", flush=True)
             if self._in_tracks_branch(src):
                 self._tracks_lost = True
+                if self.pipeline:
+                    self.pipeline.set_state(Gst.State.PLAYING)
+                return
+            if self._is_abl_element(src):
+                # Fall back to the next audio source instead of stopping the program.
+                self._abl_lost = True
                 if self.pipeline:
                     self.pipeline.set_state(Gst.State.PLAYING)
                 return
@@ -1151,6 +1236,8 @@ class StudioMixer:
         self.align_fallback_clock()
         self.select_video_source(self.cam_using_fallback)
         self.pipeline_running = True
+        with self.lock:
+            self._update_audio_source()
         for platform in PLATFORM_SINKS:
             if self.state.get(f"{platform}_enabled") and self.platform_configured(platform):
                 try:
@@ -1179,18 +1266,23 @@ class StudioMixer:
         self._fb_parse_src = None
         self.pipeline_running = False
         self.cam_using_fallback = False
+        self._abl_in_pipeline = False
 
     def pipeline_thread(self) -> None:
         self._pipeline_thread_id = threading.get_ident()
         while not self._stop:
-            print("waiting for ableton or tracks (+ cam or fallback video)…", flush=True)
+            print("waiting for audio (tracks, ableton or cam) + cam or fallback video…", flush=True)
             while not self._stop and not self.sources_ready():
                 time.sleep(2)
             if self._stop:
                 return
             audio = "+".join(
                     n
-                    for n, up in (("ableton", self.ableton_ready), ("tracks", self.tracks_ready))
+                    for n, up in (
+                        ("tracks", self.tracks_ready),
+                        ("ableton", self.ableton_ready),
+                        ("gopro", self.cam_ready),
+                    )
                     if up
                 )
             video = "camera" if self.cam_ready else "fallback video"
@@ -1249,11 +1341,14 @@ class ControlHandler(SimpleHTTPRequestHandler):
         for key in DEFAULT_STATE:
             if key not in body:
                 continue
-            if key.endswith("_enabled"):
+            if key.endswith("_enabled") or key.endswith("_muted"):
                 updates[key] = bool(body[key])
             elif key == "video_rotation":
                 rotation = int(body[key])
                 updates[key] = rotation if rotation in VIDEO_ROTATION_METHODS else 0
+            elif key == "solo_track":
+                solo = int(body[key])
+                updates[key] = solo if 1 <= solo <= NUM_TRACKS else 0
             elif key == "stream_video_bitrate_kbps":
                 updates[key] = max(800, min(4500, int(body[key])))
             elif key == "stream_audio_bitrate_kbps":
